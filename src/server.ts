@@ -29,11 +29,11 @@ interface ChatState {
 const CONFIG = {
   SAMPLE_RATE: 16000,
   FLUSH_INTERVAL_MS: 6000,
-  MIN_CHUNK_DURATION_MS: 4000,
-  RMS_THRESHOLD: 800,
-  SILENCE_THRESHOLD: 500,
+  MIN_CHUNK_DURATION_MS: 2000,
+  RMS_THRESHOLD: 400,
+  SILENCE_THRESHOLD: 250,
   MAX_BUFFER_SIZE: 16000 * 20 * 2,
-  SILENCE_CHUNKS_REQUIRED: 3,
+  SILENCE_CHUNKS_REQUIRED: 2,
   COOLDOWN_MS: 2000,
   HALLUCINATIONS: [
     "subtítulos realizados por",
@@ -44,7 +44,6 @@ const CONFIG = {
     "comunidad de",
   ],
 };
-
 let chatState: ChatState = {
   audioBuffers: [],
   recentBuffers: [],
