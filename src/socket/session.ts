@@ -16,6 +16,10 @@ export function createSessionState(): SessionState {
     speaking: false,
     silenceMs: 0,
     noiseDb: INITIAL_NOISE_DB,
+    smoothDb: INITIAL_NOISE_DB,
+    speechCandidateMs: 0,
+    speechMs: 0,
+    candidateBuffers: [],
     segmentBuffers: [],
   };
 }

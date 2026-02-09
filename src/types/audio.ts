@@ -40,5 +40,9 @@ export interface SessionState {
   speaking: boolean;
   silenceMs: number;
   noiseDb: number;
+  smoothDb: number;
+  speechCandidateMs: number;
+  speechMs: number;
+  candidateBuffers: Buffer[];
   segmentBuffers: Buffer[];
 }
