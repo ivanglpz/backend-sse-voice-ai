@@ -1,20 +1,28 @@
 import { type Server, type Socket } from "socket.io";
 import { rmsDb } from "../audio/pcm";
 import {
-  DEFAULT_CHANNELS,
-  DEFAULT_ENCODING,
-  DEFAULT_SAMPLE_RATE,
-  INITIAL_NOISE_DB,
   LEVEL_SMOOTHING_ALPHA,
   MIN_SEGMENT_MS,
-  MIN_SPEECH_DB,
-  NOISE_UPDATE_ALPHA,
   NOISE_UPDATE_GATE_DB,
   SILENCE_MS_TO_FINALIZE,
-  SPEECH_MARGIN_DB,
   START_SPEECH_MIN_MS,
 } from "../config/constants";
 import { createSessionState } from "./session";
+import { pcm16BufferToFloat32 } from "./audio/pcm16";
+import {
+  beginSegmentTranscription,
+  applyAudioStart,
+  finishSegmentTranscription,
+  clearActiveSegment,
+  stopSession,
+} from "./audio/sessionLifecycle";
+import { shouldEmitTranscript } from "./audio/transcript";
+import {
+  shouldLogNonSpeech,
+  shouldTreatAsSpeech,
+  speechThresholdDb,
+  updateNoiseFloor,
+} from "./audio/vad";
 import { transcribePcm16 } from "../transcription/transcribe";
 import type {
   AudioStartPayload,
@@ -23,52 +31,6 @@ import type {
   ServerToClientEvents,
   SocketData,
 } from "../types/audio";
-
-function pcm16BufferToFloat32(chunk: Buffer): Float32Array {
-  const sampleCount = Math.floor(chunk.length / 2);
-  const out = new Float32Array(sampleCount);
-  for (let i = 0; i < sampleCount; i += 1) {
-    const sample = chunk.readInt16LE(i * 2);
-    out[i] = sample / 32768;
-  }
-  return out;
-}
-
-function shouldTreatAsSpeech(db: number, noiseDb: number): boolean {
-  return db > Math.max(noiseDb + SPEECH_MARGIN_DB, MIN_SPEECH_DB);
-}
-
-function updateNoiseFloor(currentNoiseDb: number, db: number): number {
-  if (db > currentNoiseDb + NOISE_UPDATE_GATE_DB) {
-    return currentNoiseDb;
-  }
-  return (1 - NOISE_UPDATE_ALPHA) * currentNoiseDb + NOISE_UPDATE_ALPHA * db;
-}
-
-function shouldLogNonSpeech(state: { lastNonSpeechLogAt: number }): boolean {
-  const now = Date.now();
-  if (now - state.lastNonSpeechLogAt < 1500) return false;
-  state.lastNonSpeechLogAt = now;
-  return true;
-}
-
-function shouldEmitTranscript(
-  state: { lastTranscriptText: string; lastTranscriptAt: number },
-  text: string,
-): boolean {
-  const cleaned = text.trim();
-  if (!cleaned) return false;
-
-  const now = Date.now();
-  const isDuplicate =
-    cleaned.toLowerCase() === state.lastTranscriptText.toLowerCase() &&
-    now - state.lastTranscriptAt < 2000;
-  if (isDuplicate) return false;
-
-  state.lastTranscriptText = cleaned;
-  state.lastTranscriptAt = now;
-  return true;
-}
 
 export function registerAudioHandlers(
   io: Server<
@@ -84,25 +46,7 @@ export function registerAudioHandlers(
       const state = createSessionState();
 
       socket.on("audio:start", (meta: AudioStartPayload) => {
-        state.active = true;
-        state.sampleRate = meta.sampleRate || DEFAULT_SAMPLE_RATE;
-        state.channels = meta.channels || DEFAULT_CHANNELS;
-        state.encoding = meta.encoding || DEFAULT_ENCODING;
-        state.chatId = meta.chatId ?? null;
-
-        state.speaking = false;
-        state.silenceMs = 0;
-        state.noiseDb = INITIAL_NOISE_DB;
-        state.smoothDb = INITIAL_NOISE_DB;
-        state.speechCandidateMs = 0;
-        state.speechMs = 0;
-        state.lastNonSpeechLogAt = 0;
-        state.isProcessingTranscription = false;
-        state.lastTranscriptText = "";
-        state.lastTranscriptAt = 0;
-        state.candidateBuffers = [];
-        state.segmentBuffers = [];
-
+        applyAudioStart(state, meta);
         socket.emit("audio:ack", { ok: true });
       });
 
@@ -126,10 +70,7 @@ export function registerAudioHandlers(
 
           if (!isSpeechFrame) {
             const soundDetectedDb = state.noiseDb + NOISE_UPDATE_GATE_DB;
-            if (
-              state.smoothDb > soundDetectedDb &&
-              shouldLogNonSpeech(state)
-            ) {
+            if (state.smoothDb > soundDetectedDb && shouldLogNonSpeech(state)) {
               console.log(
                 `[VAD] Se detecta sonido de fondo, pero todavía no parece voz (db=${state.smoothDb.toFixed(
                   1,
@@ -151,7 +92,7 @@ export function registerAudioHandlers(
           console.log(
             `[VAD] speaking:start chatId=${state.chatId ?? "unknown"} db=${state.smoothDb.toFixed(
               1,
-            )} threshold=${Math.max(state.noiseDb + SPEECH_MARGIN_DB, MIN_SPEECH_DB).toFixed(1)}`,
+            )} threshold=${speechThresholdDb(state.noiseDb).toFixed(1)}`,
           );
           console.log("[VAD] La persona esta hablando ahora.");
           state.speaking = true;
@@ -184,26 +125,15 @@ export function registerAudioHandlers(
                 state.speechMs,
               )}`,
             );
-            state.speaking = false;
-            state.silenceMs = 0;
-            state.speechMs = 0;
-            state.segmentBuffers = [];
+            clearActiveSegment(state);
             return;
           }
 
-          const segmentToProcess = state.segmentBuffers.slice();
-          const segmentSpeechMs = state.speechMs;
-          state.isProcessingTranscription = true;
-          state.speaking = false;
-          state.silenceMs = 0;
-          state.speechMs = 0;
-          state.segmentBuffers = [];
+          const { buffers: segmentToProcess, speechMs: segmentSpeechMs } =
+            beginSegmentTranscription(state);
 
           try {
-            const text = await transcribePcm16(
-              segmentToProcess,
-              state.sampleRate,
-            );
+            const text = await transcribePcm16(segmentToProcess, state.sampleRate);
             if (shouldEmitTranscript(state, text)) {
               socket.emit("transcript:final", {
                 chatId: state.chatId ?? "unknown",
@@ -213,7 +143,7 @@ export function registerAudioHandlers(
           } catch (error) {
             console.error("[STT] Error transcribing audio segment:", error);
           } finally {
-            state.isProcessingTranscription = false;
+            finishSegmentTranscription(state);
           }
           console.log(
             `[VAD] Termine de procesar el segmento de voz (duracion hablada ~${Math.round(
@@ -231,19 +161,11 @@ export function registerAudioHandlers(
         }
 
         if (state.segmentBuffers.length > 0 && state.speechMs >= MIN_SEGMENT_MS) {
-          const trailingSegment = state.segmentBuffers.slice();
-          const trailingSpeechMs = state.speechMs;
-          state.isProcessingTranscription = true;
-          state.speaking = false;
-          state.silenceMs = 0;
-          state.speechMs = 0;
-          state.segmentBuffers = [];
+          const { buffers: trailingSegment, speechMs: trailingSpeechMs } =
+            beginSegmentTranscription(state);
 
           try {
-            const text = await transcribePcm16(
-              trailingSegment,
-              state.sampleRate,
-            );
+            const text = await transcribePcm16(trailingSegment, state.sampleRate);
             if (shouldEmitTranscript(state, text)) {
               socket.emit("transcript:final", {
                 chatId: state.chatId ?? "unknown",
@@ -253,7 +175,7 @@ export function registerAudioHandlers(
           } catch (error) {
             console.error("[STT] Error transcribing trailing audio:", error);
           } finally {
-            state.isProcessingTranscription = false;
+            finishSegmentTranscription(state);
           }
           console.log(
             `[VAD] Termine de procesar el audio restante al cerrar (duracion hablada ~${Math.round(
@@ -262,17 +184,7 @@ export function registerAudioHandlers(
           );
         }
 
-        state.active = false;
-        state.speaking = false;
-        state.silenceMs = 0;
-        state.noiseDb = INITIAL_NOISE_DB;
-        state.smoothDb = INITIAL_NOISE_DB;
-        state.speechCandidateMs = 0;
-        state.speechMs = 0;
-        state.lastNonSpeechLogAt = 0;
-        state.isProcessingTranscription = false;
-        state.candidateBuffers = [];
-        state.segmentBuffers = [];
+        stopSession(state);
       });
     },
   );
