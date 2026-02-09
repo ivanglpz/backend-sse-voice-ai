@@ -20,6 +20,9 @@ export function createSessionState(): SessionState {
     speechCandidateMs: 0,
     speechMs: 0,
     lastNonSpeechLogAt: 0,
+    isProcessingTranscription: false,
+    lastTranscriptText: "",
+    lastTranscriptAt: 0,
     candidateBuffers: [],
     segmentBuffers: [],
   };

@@ -52,6 +52,24 @@ function shouldLogNonSpeech(state: { lastNonSpeechLogAt: number }): boolean {
   return true;
 }
 
+function shouldEmitTranscript(
+  state: { lastTranscriptText: string; lastTranscriptAt: number },
+  text: string,
+): boolean {
+  const cleaned = text.trim();
+  if (!cleaned) return false;
+
+  const now = Date.now();
+  const isDuplicate =
+    cleaned.toLowerCase() === state.lastTranscriptText.toLowerCase() &&
+    now - state.lastTranscriptAt < 2000;
+  if (isDuplicate) return false;
+
+  state.lastTranscriptText = cleaned;
+  state.lastTranscriptAt = now;
+  return true;
+}
+
 export function registerAudioHandlers(
   io: Server<
     ClientToServerEvents,
@@ -79,6 +97,9 @@ export function registerAudioHandlers(
         state.speechCandidateMs = 0;
         state.speechMs = 0;
         state.lastNonSpeechLogAt = 0;
+        state.isProcessingTranscription = false;
+        state.lastTranscriptText = "";
+        state.lastTranscriptAt = 0;
         state.candidateBuffers = [];
         state.segmentBuffers = [];
 
@@ -87,6 +108,7 @@ export function registerAudioHandlers(
 
       socket.on("audio:chunk", async (chunk: Buffer) => {
         if (!state.active) return;
+        if (state.isProcessingTranscription) return;
         if (!Buffer.isBuffer(chunk)) return;
         if (chunk.length < 2) return;
 
@@ -150,6 +172,7 @@ export function registerAudioHandlers(
         }
 
         if (state.silenceMs >= SILENCE_MS_TO_FINALIZE) {
+          if (state.isProcessingTranscription) return;
           console.log(
             `[VAD] speaking:stop chatId=${state.chatId ?? "unknown"} silenceMs=${Math.round(
               state.silenceMs,
@@ -167,42 +190,74 @@ export function registerAudioHandlers(
             state.segmentBuffers = [];
             return;
           }
-          const text = await transcribePcm16(
-            state.segmentBuffers,
-            state.sampleRate,
-          );
-          socket.emit("transcript:final", {
-            chatId: state.chatId ?? "unknown",
-            text,
-          });
-          console.log(
-            `[VAD] Termine de procesar el segmento de voz (duracion hablada ~${Math.round(
-              state.speechMs,
-            )}ms).`,
-          );
 
+          const segmentToProcess = state.segmentBuffers.slice();
+          const segmentSpeechMs = state.speechMs;
+          state.isProcessingTranscription = true;
           state.speaking = false;
           state.silenceMs = 0;
           state.speechMs = 0;
           state.segmentBuffers = [];
+
+          try {
+            const text = await transcribePcm16(
+              segmentToProcess,
+              state.sampleRate,
+            );
+            if (shouldEmitTranscript(state, text)) {
+              socket.emit("transcript:final", {
+                chatId: state.chatId ?? "unknown",
+                text,
+              });
+            }
+          } catch (error) {
+            console.error("[STT] Error transcribing audio segment:", error);
+          } finally {
+            state.isProcessingTranscription = false;
+          }
+          console.log(
+            `[VAD] Termine de procesar el segmento de voz (duracion hablada ~${Math.round(
+              segmentSpeechMs,
+            )}ms).`,
+          );
         }
       });
 
       socket.on("audio:stop", async () => {
         if (!state.active) return;
+        if (state.isProcessingTranscription) {
+          state.active = false;
+          return;
+        }
 
         if (state.segmentBuffers.length > 0 && state.speechMs >= MIN_SEGMENT_MS) {
-          const text = await transcribePcm16(
-            state.segmentBuffers,
-            state.sampleRate,
-          );
-          socket.emit("transcript:final", {
-            chatId: state.chatId ?? "unknown",
-            text,
-          });
+          const trailingSegment = state.segmentBuffers.slice();
+          const trailingSpeechMs = state.speechMs;
+          state.isProcessingTranscription = true;
+          state.speaking = false;
+          state.silenceMs = 0;
+          state.speechMs = 0;
+          state.segmentBuffers = [];
+
+          try {
+            const text = await transcribePcm16(
+              trailingSegment,
+              state.sampleRate,
+            );
+            if (shouldEmitTranscript(state, text)) {
+              socket.emit("transcript:final", {
+                chatId: state.chatId ?? "unknown",
+                text,
+              });
+            }
+          } catch (error) {
+            console.error("[STT] Error transcribing trailing audio:", error);
+          } finally {
+            state.isProcessingTranscription = false;
+          }
           console.log(
             `[VAD] Termine de procesar el audio restante al cerrar (duracion hablada ~${Math.round(
-              state.speechMs,
+              trailingSpeechMs,
             )}ms).`,
           );
         }
@@ -215,6 +270,7 @@ export function registerAudioHandlers(
         state.speechCandidateMs = 0;
         state.speechMs = 0;
         state.lastNonSpeechLogAt = 0;
+        state.isProcessingTranscription = false;
         state.candidateBuffers = [];
         state.segmentBuffers = [];
       });

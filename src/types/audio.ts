@@ -44,6 +44,9 @@ export interface SessionState {
   speechCandidateMs: number;
   speechMs: number;
   lastNonSpeechLogAt: number;
+  isProcessingTranscription: boolean;
+  lastTranscriptText: string;
+  lastTranscriptAt: number;
   candidateBuffers: Buffer[];
   segmentBuffers: Buffer[];
 }
