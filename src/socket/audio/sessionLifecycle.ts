@@ -23,6 +23,9 @@ export function applyAudioStart(state: SessionState, meta: AudioStartPayload): v
   state.isProcessingTranscription = false;
   state.lastTranscriptText = "";
   state.lastTranscriptAt = 0;
+  state.isProcessingAssistant = false;
+  state.pendingAssistantTurns = [];
+  state.conversationHistory = [];
   state.candidateBuffers = [];
   state.segmentBuffers = [];
 }
@@ -61,6 +64,9 @@ export function stopSession(state: SessionState): void {
   state.speechMs = 0;
   state.lastNonSpeechLogAt = 0;
   state.isProcessingTranscription = false;
+  state.isProcessingAssistant = false;
+  state.pendingAssistantTurns = [];
+  state.conversationHistory = [];
   state.candidateBuffers = [];
   state.segmentBuffers = [];
 }

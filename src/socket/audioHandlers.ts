@@ -24,6 +24,7 @@ import {
   updateNoiseFloor,
 } from "./audio/vad";
 import { transcribePcm16 } from "../transcription/transcribe";
+import { getVoiceAssistantService } from "../services/assistant";
 import type {
   AudioStartPayload,
   ClientToServerEvents,
@@ -44,6 +45,69 @@ export function registerAudioHandlers(
     "connection",
     (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
       const state = createSessionState();
+
+      const emitTranscriptAndEnqueueAssistant = (text: string) => {
+        const cleanedText = text.trim();
+        if (!shouldEmitTranscript(state, cleanedText)) return;
+
+        socket.emit("transcript:final", {
+          chatId: state.chatId ?? "unknown",
+          text: cleanedText,
+        });
+        state.pendingAssistantTurns.push(cleanedText);
+        void processAssistantQueue();
+      };
+
+      const processAssistantQueue = async () => {
+        if (state.isProcessingAssistant) return;
+        const userText = state.pendingAssistantTurns.shift();
+        if (!userText) return;
+
+        state.isProcessingAssistant = true;
+
+        try {
+          const assistantService = getVoiceAssistantService();
+          const assistantReply = await assistantService.generateReply({
+            history: state.conversationHistory,
+            userText,
+          });
+
+          state.conversationHistory.push({
+            role: "user",
+            content: userText,
+          });
+          state.conversationHistory.push({
+            role: "assistant",
+            content: assistantReply.text,
+          });
+          if (state.conversationHistory.length > 20) {
+            state.conversationHistory = state.conversationHistory.slice(-20);
+          }
+
+          socket.emit("assistant:response", {
+            chatId: state.chatId ?? "unknown",
+            text: assistantReply.text,
+          });
+          socket.emit("assistant:audio", {
+            chatId: state.chatId ?? "unknown",
+            format: assistantReply.format,
+            mimeType: assistantReply.mimeType,
+            audioBase64: assistantReply.audioBase64,
+          });
+        } catch (error) {
+          console.error("[ASSISTANT] Error generating AI voice response:", error);
+          socket.emit("assistant:error", {
+            chatId: state.chatId ?? "unknown",
+            message:
+              "No pude generar la respuesta por voz en este momento. Intenta de nuevo.",
+          });
+        } finally {
+          state.isProcessingAssistant = false;
+          if (state.pendingAssistantTurns.length > 0) {
+            void processAssistantQueue();
+          }
+        }
+      };
 
       socket.on("audio:start", (meta: AudioStartPayload) => {
         applyAudioStart(state, meta);
@@ -134,12 +198,7 @@ export function registerAudioHandlers(
 
           try {
             const text = await transcribePcm16(segmentToProcess, state.sampleRate);
-            if (shouldEmitTranscript(state, text)) {
-              socket.emit("transcript:final", {
-                chatId: state.chatId ?? "unknown",
-                text,
-              });
-            }
+            emitTranscriptAndEnqueueAssistant(text);
           } catch (error) {
             console.error("[STT] Error transcribing audio segment:", error);
           } finally {
@@ -166,12 +225,7 @@ export function registerAudioHandlers(
 
           try {
             const text = await transcribePcm16(trailingSegment, state.sampleRate);
-            if (shouldEmitTranscript(state, text)) {
-              socket.emit("transcript:final", {
-                chatId: state.chatId ?? "unknown",
-                text,
-              });
-            }
+            emitTranscriptAndEnqueueAssistant(text);
           } catch (error) {
             console.error("[STT] Error transcribing trailing audio:", error);
           } finally {

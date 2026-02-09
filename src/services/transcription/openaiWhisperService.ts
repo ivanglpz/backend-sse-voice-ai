@@ -1,7 +1,6 @@
-import fs from "node:fs";
-import { promises as fsp } from "node:fs";
-import path from "node:path";
 import { randomUUID } from "node:crypto";
+import fs, { promises as fsp } from "node:fs";
+import path from "node:path";
 import OpenAI from "openai";
 import { pcmToWav } from "../../audio/wav";
 
@@ -34,12 +33,13 @@ export class OpenAIWhisperTranscriptionService implements TranscriptionService {
     try {
       const transcription = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(filePath),
-        model: "whisper-1",
+        model: "gpt-4o-transcribe",
         language,
         prompt:
-          "Transcribe faithfully the audio in Spanish. " +
-          "If a word or phrase is unclear, infer it from context to improve understanding. " +
-          "Do not add personal comments or explanations.",
+          "Transcribe fielmente el audio en español. " +
+          "No traduzcas ni conviertas nada al inglés; mantén todo el contenido en español. " +
+          "Si una palabra o frase no es clara, infiérela por contexto para mejorar la comprensión. " +
+          "No agregues comentarios ni explicaciones personales.",
       });
 
       return transcription.text.trim();

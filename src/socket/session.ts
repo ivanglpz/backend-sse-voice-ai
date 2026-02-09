@@ -23,6 +23,9 @@ export function createSessionState(): SessionState {
     isProcessingTranscription: false,
     lastTranscriptText: "",
     lastTranscriptAt: 0,
+    isProcessingAssistant: false,
+    pendingAssistantTurns: [],
+    conversationHistory: [],
     candidateBuffers: [],
     segmentBuffers: [],
   };
