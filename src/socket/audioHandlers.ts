@@ -45,6 +45,13 @@ function updateNoiseFloor(currentNoiseDb: number, db: number): number {
   return (1 - NOISE_UPDATE_ALPHA) * currentNoiseDb + NOISE_UPDATE_ALPHA * db;
 }
 
+function shouldLogNonSpeech(state: { lastNonSpeechLogAt: number }): boolean {
+  const now = Date.now();
+  if (now - state.lastNonSpeechLogAt < 1500) return false;
+  state.lastNonSpeechLogAt = now;
+  return true;
+}
+
 export function registerAudioHandlers(
   io: Server<
     ClientToServerEvents,
@@ -71,6 +78,7 @@ export function registerAudioHandlers(
         state.smoothDb = INITIAL_NOISE_DB;
         state.speechCandidateMs = 0;
         state.speechMs = 0;
+        state.lastNonSpeechLogAt = 0;
         state.candidateBuffers = [];
         state.segmentBuffers = [];
 
@@ -95,6 +103,17 @@ export function registerAudioHandlers(
           state.noiseDb = updateNoiseFloor(state.noiseDb, state.smoothDb);
 
           if (!isSpeechFrame) {
+            const soundDetectedDb = state.noiseDb + NOISE_UPDATE_GATE_DB;
+            if (
+              state.smoothDb > soundDetectedDb &&
+              shouldLogNonSpeech(state)
+            ) {
+              console.log(
+                `[VAD] Se detecta sonido de fondo, pero todavía no parece voz (db=${state.smoothDb.toFixed(
+                  1,
+                )}).`,
+              );
+            }
             state.speechCandidateMs = 0;
             state.candidateBuffers = [];
             return;
@@ -112,6 +131,7 @@ export function registerAudioHandlers(
               1,
             )} threshold=${Math.max(state.noiseDb + SPEECH_MARGIN_DB, MIN_SPEECH_DB).toFixed(1)}`,
           );
+          console.log("[VAD] La persona esta hablando ahora.");
           state.speaking = true;
           state.silenceMs = 0;
           state.speechMs = state.speechCandidateMs;
@@ -155,6 +175,11 @@ export function registerAudioHandlers(
             chatId: state.chatId ?? "unknown",
             text,
           });
+          console.log(
+            `[VAD] Termine de procesar el segmento de voz (duracion hablada ~${Math.round(
+              state.speechMs,
+            )}ms).`,
+          );
 
           state.speaking = false;
           state.silenceMs = 0;
@@ -175,6 +200,11 @@ export function registerAudioHandlers(
             chatId: state.chatId ?? "unknown",
             text,
           });
+          console.log(
+            `[VAD] Termine de procesar el audio restante al cerrar (duracion hablada ~${Math.round(
+              state.speechMs,
+            )}ms).`,
+          );
         }
 
         state.active = false;
@@ -184,6 +214,7 @@ export function registerAudioHandlers(
         state.smoothDb = INITIAL_NOISE_DB;
         state.speechCandidateMs = 0;
         state.speechMs = 0;
+        state.lastNonSpeechLogAt = 0;
         state.candidateBuffers = [];
         state.segmentBuffers = [];
       });

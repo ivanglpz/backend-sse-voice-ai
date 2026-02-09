@@ -19,6 +19,7 @@ export function createSessionState(): SessionState {
     smoothDb: INITIAL_NOISE_DB,
     speechCandidateMs: 0,
     speechMs: 0,
+    lastNonSpeechLogAt: 0,
     candidateBuffers: [],
     segmentBuffers: [],
   };

@@ -43,6 +43,7 @@ export interface SessionState {
   smoothDb: number;
   speechCandidateMs: number;
   speechMs: number;
+  lastNonSpeechLogAt: number;
   candidateBuffers: Buffer[];
   segmentBuffers: Buffer[];
 }
