@@ -339,22 +339,6 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-app.post("/chat", async (req, res) => {
-  const { message } = req.body;
-
-  if (!message) {
-    return res.status(400).json({ error: "Message is required" });
-  }
-
-  try {
-    const reply = await getAIResponse(message);
-    res.json({ reply });
-  } catch (error) {
-    console.error("AI request failed:", error);
-    res.status(500).json({ error: "Failed to get AI response" });
-  }
-});
-
 app.get("/", (_req, res) => {
   res.json({ status: "ok", message: "Service is running" });
 });
