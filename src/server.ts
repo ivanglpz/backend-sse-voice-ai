@@ -1,357 +1,206 @@
-import "dotenv/config";
-import express from "express";
-import fs from "fs";
-import http from "http";
-import OpenAI from "openai";
-import path from "path";
-import { Server as SocketIOServer } from "socket.io";
+import express, { type Express } from "express";
+import { createServer, type Server as HttpServer } from "node:http";
+import { Server, type Socket } from "socket.io";
 
-const app = express();
-app.use(express.json());
+type AudioEncoding = "pcm_s16le";
 
-const server = http.createServer(app);
-const io = new SocketIOServer(server, {
-  cors: { origin: "*" },
-});
-
-interface ChatState {
-  audioBuffers: Buffer[];
-  recentBuffers: Buffer[];
-  lastFlush: number;
-  firstChunkTime: number | null;
-  totalBytesReceived: number;
-  isProcessing: boolean;
-  lastProcessedTime: number;
-  lastTranscribedText: string;
-  language: string;
+interface AudioStartPayload {
+  chatId: string;
+  sampleRate: number;
+  channels: number;
+  encoding: AudioEncoding;
 }
 
-const CONFIG = {
-  SAMPLE_RATE: 16000,
-  FLUSH_INTERVAL_MS: 6000,
-  MIN_CHUNK_DURATION_MS: 2000,
-  RMS_THRESHOLD: 400,
-  SILENCE_THRESHOLD: 250,
-  MAX_BUFFER_SIZE: 16000 * 20 * 2,
-  SILENCE_CHUNKS_REQUIRED: 2,
-  COOLDOWN_MS: 2000,
-  HALLUCINATIONS: [
-    "subtítulos realizados por",
-    "amara.org",
-    "nos vemos en el próximo",
-    "gracias por ver",
-    "suscríbete",
-    "comunidad de",
-  ],
-};
-let chatState: ChatState = {
-  audioBuffers: [],
-  recentBuffers: [],
-  lastFlush: Date.now(),
-  firstChunkTime: null,
-  totalBytesReceived: 0,
-  isProcessing: false,
-  lastProcessedTime: 0,
-  lastTranscribedText: "",
-  language: "es",
-};
+interface AudioAckPayload {
+  ok: boolean;
+}
 
-const createWavHeader = (pcmLength: number, sampleRate: number): Buffer => {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
-  const blockAlign = (numChannels * bitsPerSample) / 8;
+interface TranscriptFinalPayload {
+  chatId: string;
+  text: string;
+}
 
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcmLength, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(pcmLength, 40);
-  return header;
-};
+interface ServerToClientEvents {
+  "audio:ack": (payload: AudioAckPayload) => void;
+  "transcript:final": (payload: TranscriptFinalPayload) => void;
+}
 
-const pcmToWav = (pcm: Buffer, sampleRate: number): Buffer =>
-  Buffer.concat([createWavHeader(pcm.length, sampleRate), pcm]);
+interface ClientToServerEvents {
+  "audio:start": (payload: AudioStartPayload) => void;
+  "audio:chunk": (chunk: Buffer) => void; // binario
+  "audio:stop": () => void;
+}
 
-const calculateRMS = (pcm: Buffer): number => {
-  const numSamples = pcm.length / 2;
-  let sumSquares = 0;
-  for (let i = 0; i < pcm.length; i += 2) {
-    const sample = pcm.readInt16LE(i);
-    sumSquares += sample * sample;
-  }
-  return Math.sqrt(sumSquares / numSamples);
-};
+interface InterServerEvents {}
 
-const getAverageRMS = (buffers: Buffer[]): number =>
-  buffers.length === 0
-    ? 0
-    : buffers.reduce((sum, buf) => sum + calculateRMS(buf), 0) / buffers.length;
+interface SocketData {}
 
-const endsWithSilence = (
-  recentBuffers: Buffer[],
-  threshold: number,
-  chunksRequired: number,
-): boolean => {
-  if (recentBuffers.length < chunksRequired) return false;
-  return getAverageRMS(recentBuffers.slice(-chunksRequired)) < threshold;
-};
+interface SessionState {
+  active: boolean;
+  sampleRate: number;
+  channels: number;
+  encoding: AudioEncoding;
+  chatId: string | null;
 
-const isHallucinatedText = (text: string): boolean =>
-  CONFIG.HALLUCINATIONS.some((phrase) => text.toLowerCase().includes(phrase));
+  speaking: boolean;
+  silenceMs: number;
+  noiseDb: number;
 
-const isSimilarText = (text1: string, text2: string): boolean => {
-  if (!text1) return false;
-  return text1.toLowerCase().trim() === text2.toLowerCase().trim();
-};
+  segmentBuffers: Buffer[];
+}
 
-const addAudioChunk = (chunk: Buffer) => {
-  chatState.recentBuffers = [...chatState.recentBuffers, chunk].slice(-5);
-  chatState.audioBuffers.push(chunk);
-  chatState.totalBytesReceived += chunk.length;
-  chatState.firstChunkTime ??= Date.now();
-};
+const app: Express = express();
+const httpServer: HttpServer = createServer(app);
 
-const resetAudioBuffers = () => {
-  chatState.audioBuffers = [];
-  chatState.lastFlush = Date.now();
-  chatState.firstChunkTime = null;
-};
-
-const markAsProcessing = () => (chatState.isProcessing = true);
-const markAsProcessed = (text: string) => {
-  chatState.isProcessing = false;
-  chatState.lastProcessedTime = Date.now();
-  chatState.lastTranscribedText = text;
-};
-
-const shouldFlushAudio = (): boolean => {
-  if (chatState.isProcessing) return false;
-  const now = Date.now();
-  const bufferSize = chatState.audioBuffers.reduce(
-    (sum, b) => sum + b.length,
-    0,
-  );
-  const elapsed = now - chatState.lastFlush;
-  const totalDuration = now - (chatState.firstChunkTime ?? now);
-
-  return (
-    bufferSize > CONFIG.MAX_BUFFER_SIZE ||
-    (elapsed >= CONFIG.FLUSH_INTERVAL_MS &&
-      totalDuration >= CONFIG.MIN_CHUNK_DURATION_MS &&
-      endsWithSilence(
-        chatState.recentBuffers,
-        CONFIG.SILENCE_THRESHOLD,
-        CONFIG.SILENCE_CHUNKS_REQUIRED,
-      ))
-  );
-};
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-const saveWavFile = (wavBuffer: Buffer) => {
-  const filePath = path.join("/tmp", `audio-${Date.now()}.wav`);
-  fs.writeFileSync(filePath, wavBuffer);
-  return filePath;
-};
-
-const cleanupFile = async (filePath: string) => {
-  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-};
-
-const transcribeAudio = async (filePath: string, language = "es") => {
-  const transcription = await openai.audio.transcriptions.create({
-    file: fs.createReadStream(filePath),
-    model: "whisper-1",
-    language,
-    prompt:
-      "Transcribe faithfully the audio in Spanish. " +
-      "If a word or phrase is unclear, infer it from context to improve understanding. " +
-      "Do not add personal comments or explanations. " +
-      "Preserve the conversational meaning and complete incomplete phrases when necessary.",
-  });
-  return transcription.text.trim();
-};
-
-const getAIResponse = async (userMessage: string) => {
-  const response = await openai.chat.completions.create({
-    model: "gpt-5.2",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a voice assistant in a phone call. " +
-          "Respond in Spanish with a friendly, clear, and professional tone. " +
-          "Keep responses concise and natural, as if speaking directly to the caller.",
-      },
-      { role: "user", content: userMessage },
-    ],
-  });
-  return response.choices?.[0]?.message?.content?.trim() || "";
-};
-
-const processAudioChunk = async (socket: any) => {
-  if (chatState.isProcessing) return;
-  markAsProcessing();
-
-  socket.emit("processing_status", {
-    status: "started",
-    timestamp: Date.now(),
-  });
-  const pcmBuffer = Buffer.concat(chatState.audioBuffers);
-  const rms = calculateRMS(pcmBuffer);
-  if (rms < CONFIG.RMS_THRESHOLD) {
-    markAsProcessed("");
-    resetAudioBuffers();
-    socket.emit("processing_status", {
-      status: "finished",
-      timestamp: Date.now(),
-    });
-    return;
-  }
-
-  let filePath: string | null = null;
-
-  try {
-    const wavBuffer = pcmToWav(pcmBuffer, CONFIG.SAMPLE_RATE);
-    filePath = saveWavFile(wavBuffer);
-    socket.emit("processing_status", {
-      status: "in_progress",
-      timestamp: Date.now(),
-    });
-
-    const text = await transcribeAudio(filePath, chatState.language);
-
-    if (
-      !text ||
-      isHallucinatedText(text) ||
-      isSimilarText(chatState.lastTranscribedText, text)
-    ) {
-      markAsProcessed(text);
-      resetAudioBuffers();
-      socket.emit("processing_status", {
-        status: "finished",
-        timestamp: Date.now(),
-      });
-      return;
-    }
-
-    socket.emit("transcription", { text, timestamp: Date.now() });
-
-    const aiReply = await getAIResponse(text);
-    if (aiReply)
-      socket.emit("processing_status", {
-        status: "finished",
-        timestamp: Date.now(),
-      });
-    socket.emit("ai_response", { text: aiReply, timestamp: Date.now() });
-
-    markAsProcessed(text);
-  } finally {
-    if (filePath) await cleanupFile(filePath);
-    resetAudioBuffers();
-  }
-};
-
-io.on("connection", (socket) => {
-  const { language = "es" } = socket.handshake.query as { language?: string };
-  chatState.language = language;
-
-  console.log(`Client connected: ${socket.id}`);
-
-  socket.emit("connected", {
-    message: "Connected successfully",
-    timestamp: Date.now(),
-  });
-
-  socket.on("audio-chunk", async (chunk: ArrayBuffer) => {
-    addAudioChunk(Buffer.from(chunk));
-    if (shouldFlushAudio()) await processAudioChunk(socket);
-  });
-
-  socket.on("message", (msg: any) => {
-    io.emit("message", msg);
-  });
-
-  socket.on("disconnect", () => {
-    console.log(`Client disconnected: ${socket.id}`);
-  });
+const io = new Server<
+  ClientToServerEvents,
+  ServerToClientEvents,
+  InterServerEvents,
+  SocketData
+>(httpServer, {
+  cors: { origin: "*" },
+  maxHttpBufferSize: 10_000_000,
 });
 
-app.post("/chat", async (req, res) => {
-  const { message, history = [] } = req.body;
-
-  if (!message) {
-    return res.status(400).json({ error: "Message is required" });
+function pcm16ToFloat32(int16: Int16Array): Float32Array {
+  const out = new Float32Array(int16.length);
+  for (let i = 0; i < int16.length; i += 1) {
+    out[i] = int16[i] / 32768;
   }
+  return out;
+}
 
-  try {
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.flushHeaders();
+function rmsDb(samples: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) {
+    sum += samples[i] * samples[i];
+  }
+  const rms = Math.sqrt(sum / samples.length + 1e-12);
+  return 20 * Math.log10(rms + 1e-12);
+}
 
-    const messages = [
-      {
-        role: "system",
-        content:
-          "You are a helpful assistant. Respond in Spanish with a friendly tone.",
-      },
-      ...history,
-      {
-        role: "user",
-        content: message,
-      },
-    ];
+// Reemplaza con tu STT real
+async function transcribePcm16(
+  buffers: Buffer[],
+  sampleRate: number,
+): Promise<string> {
+  const totalBytes = buffers.reduce((acc, b) => acc + b.length, 0);
+  const durationSec = totalBytes / 2 / sampleRate;
+  return `[mock transcript ${durationSec.toFixed(2)}s]`;
+}
 
-    const stream = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: messages,
-      stream: true,
+io.on(
+  "connection",
+  (socket: Socket<ClientToServerEvents, ServerToClientEvents>) => {
+    const state: SessionState = {
+      active: false,
+      sampleRate: 16000,
+      channels: 1,
+      encoding: "pcm_s16le",
+      chatId: null,
+      speaking: false,
+      silenceMs: 0,
+      noiseDb: -55,
+      segmentBuffers: [],
+    };
+
+    socket.on("audio:start", (meta: AudioStartPayload) => {
+      state.active = true;
+      state.sampleRate = meta.sampleRate || 16000;
+      state.channels = meta.channels || 1;
+      state.encoding = meta.encoding || "pcm_s16le";
+      state.chatId = meta.chatId ?? null;
+
+      state.speaking = false;
+      state.silenceMs = 0;
+      state.noiseDb = -55;
+      state.segmentBuffers = [];
+
+      socket.emit("audio:ack", { ok: true });
     });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        res.write(`data: ${JSON.stringify({ content })}\n\n`);
+    socket.on("audio:chunk", async (chunk: Buffer) => {
+      if (!state.active) return;
+      if (!Buffer.isBuffer(chunk)) return;
+
+      const int16 = new Int16Array(
+        chunk.buffer,
+        chunk.byteOffset,
+        chunk.byteLength / 2,
+      );
+      const f32 = pcm16ToFloat32(int16);
+      const db = rmsDb(f32);
+
+      if (!state.speaking) {
+        state.noiseDb = 0.95 * state.noiseDb + 0.05 * db;
       }
-    }
 
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
-  } catch (error) {
-    console.error("AI streaming request failed:", error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Failed to get AI response" });
-    } else {
-      res.write(`data: ${JSON.stringify({ error: "Stream failed" })}\n\n`);
-      res.end();
-    }
-  }
-});
+      const thresholdDb = state.noiseDb + 10;
+      const frameMs = (int16.length / state.sampleRate) * 1000;
+      const isSpeech = db > thresholdDb;
 
-app.get("/", (_req, res) => {
-  res.json({ status: "ok", message: "Service is running" });
-});
-app.get("/status", (_req, res) => {
-  res.json({
-    status: "ok",
-    clientsConnected: io.sockets.sockets.size,
-    uptime: process.uptime(),
-    timestamp: Date.now(),
-    message: "Service is running",
-  });
-});
+      if (isSpeech) {
+        if (!state.speaking) {
+          console.log(
+            `[VAD] speaking:start chatId=${state.chatId ?? "unknown"} db=${db.toFixed(
+              1,
+            )} threshold=${thresholdDb.toFixed(1)}`,
+          );
+        }
+        state.speaking = true;
+        state.silenceMs = 0;
+        state.segmentBuffers.push(chunk);
+        return;
+      }
 
-server.listen(process.env.PORT || 3000, () => {
-  console.log(`Server running on port ${process.env.PORT || 3000}`);
+      if (!state.speaking) return;
+
+      state.segmentBuffers.push(chunk);
+      state.silenceMs += frameMs;
+
+      if (state.silenceMs >= 800) {
+        console.log(
+          `[VAD] speaking:stop chatId=${state.chatId ?? "unknown"} silenceMs=${Math.round(
+            state.silenceMs,
+          )}`,
+        );
+        const text = await transcribePcm16(
+          state.segmentBuffers,
+          state.sampleRate,
+        );
+        socket.emit("transcript:final", {
+          chatId: state.chatId ?? "unknown",
+          text,
+        });
+
+        state.speaking = false;
+        state.silenceMs = 0;
+        state.segmentBuffers = [];
+      }
+    });
+
+    socket.on("audio:stop", async () => {
+      if (!state.active) return;
+
+      if (state.segmentBuffers.length > 0) {
+        const text = await transcribePcm16(
+          state.segmentBuffers,
+          state.sampleRate,
+        );
+        socket.emit("transcript:final", {
+          chatId: state.chatId ?? "unknown",
+          text,
+        });
+      }
+
+      state.active = false;
+      state.speaking = false;
+      state.silenceMs = 0;
+      state.segmentBuffers = [];
+    });
+  },
+);
+
+httpServer.listen(3000, () => {
+  console.log("Socket.IO server running on :3000");
 });
