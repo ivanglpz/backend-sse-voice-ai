@@ -25,7 +25,12 @@ export interface AssistantAudioPayload {
   chatId: string;
   format: "mp3";
   mimeType: "audio/mpeg";
-  audioBase64: string;
+  sizeBytes: number;
+}
+
+export interface AssistantAudioEndPayload {
+  chatId: string;
+  totalChunks: number;
 }
 
 export interface AssistantErrorPayload {
@@ -37,7 +42,9 @@ export interface ServerToClientEvents {
   "audio:ack": (payload: AudioAckPayload) => void;
   "transcript:final": (payload: TranscriptFinalPayload) => void;
   "assistant:response": (payload: AssistantResponsePayload) => void;
-  "assistant:audio": (payload: AssistantAudioPayload) => void;
+  "assistant:audio:start": (payload: AssistantAudioPayload) => void;
+  "assistant:audio:chunk": (chunk: Buffer) => void;
+  "assistant:audio:end": (payload: AssistantAudioEndPayload) => void;
   "assistant:error": (payload: AssistantErrorPayload) => void;
 }
 

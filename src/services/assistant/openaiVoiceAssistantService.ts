@@ -8,7 +8,7 @@ const MAX_HISTORY_TURNS = 12;
 
 export interface VoiceAssistantReply {
   text: string;
-  audioBase64: string;
+  audioBuffer: Buffer;
   format: "mp3";
   mimeType: "audio/mpeg";
 }
@@ -72,7 +72,7 @@ export class OpenAIVoiceAssistantService implements VoiceAssistantService {
 
     return {
       text,
-      audioBase64: audioBuffer.toString("base64"),
+      audioBuffer,
       format: "mp3",
       mimeType: "audio/mpeg",
     };

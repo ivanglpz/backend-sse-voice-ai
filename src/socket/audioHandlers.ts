@@ -33,6 +33,8 @@ import type {
   SocketData,
 } from "../types/audio";
 
+const AUDIO_OUTPUT_CHUNK_SIZE_BYTES = 16 * 1024;
+
 export function registerAudioHandlers(
   io: Server<
     ClientToServerEvents,
@@ -88,11 +90,31 @@ export function registerAudioHandlers(
             chatId: state.chatId ?? "unknown",
             text: assistantReply.text,
           });
-          socket.emit("assistant:audio", {
+
+          socket.emit("assistant:audio:start", {
             chatId: state.chatId ?? "unknown",
             format: assistantReply.format,
             mimeType: assistantReply.mimeType,
-            audioBase64: assistantReply.audioBase64,
+            sizeBytes: assistantReply.audioBuffer.length,
+          });
+
+          let totalChunks = 0;
+          for (
+            let offset = 0;
+            offset < assistantReply.audioBuffer.length;
+            offset += AUDIO_OUTPUT_CHUNK_SIZE_BYTES
+          ) {
+            const nextChunk = assistantReply.audioBuffer.subarray(
+              offset,
+              offset + AUDIO_OUTPUT_CHUNK_SIZE_BYTES,
+            );
+            socket.emit("assistant:audio:chunk", nextChunk);
+            totalChunks += 1;
+          }
+
+          socket.emit("assistant:audio:end", {
+            chatId: state.chatId ?? "unknown",
+            totalChunks,
           });
         } catch (error) {
           console.error("[ASSISTANT] Error generating AI voice response:", error);
