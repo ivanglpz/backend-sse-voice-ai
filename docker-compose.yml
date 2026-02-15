@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16
+    container_name: backend-sse-voice-ai-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: chats
+    ports:
+      - "5432:5432"
+    volumes:
+      - backend_sse_voice_ai_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d chats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  backend_sse_voice_ai_pgdata:
